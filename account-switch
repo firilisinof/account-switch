@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Manage ChatGPT logins in one shared Codex home."""
+
+import argparse
+import base64
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from typing import Iterator
+
+
+class SwitchError(Exception):
+    pass
+
+
+def profile_name(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
+        raise argparse.ArgumentTypeError(
+            "use 1-64 letters, digits, underscores, or hyphens, starting with a letter or digit"
+        )
+    return value
+
+
+def identity(data: bytes) -> tuple[str, str]:
+    try:
+        auth = json.loads(data)
+        tokens = auth["tokens"]
+        if auth.get("auth_mode", "chatgpt") != "chatgpt":
+            raise ValueError()
+        for key in ("account_id", "id_token", "access_token", "refresh_token"):
+            if not isinstance(tokens[key], str) or not tokens[key]:
+                raise ValueError()
+        payload = tokens["id_token"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        if not isinstance(claims["sub"], str) or not claims["sub"]:
+            raise ValueError()
+        return tokens["account_id"], claims["sub"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise SwitchError("Expected saved ChatGPT credentials. Sign in with `codex login`.") from None
+
+
+def read_auth(path: Path) -> bytes:
+    if path.is_symlink():
+        raise SwitchError(f"Refusing credential symlink: {path}")
+    data = path.read_bytes()
+    identity(data)
+    return data
+
+
+def write_auth(path: Path, data: bytes) -> None:
+    if path.is_symlink():
+        raise SwitchError(f"Refusing credential symlink: {path}")
+    fd, temporary = tempfile.mkstemp(prefix=".auth-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def processes() -> list[tuple[int, str]]:
+    result = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,comm="], capture_output=True, text=True, check=True
+    )
+    rows = [line.strip().split(None, 1) for line in result.stdout.splitlines() if line.strip()]
+    return [(int(pid), command) for pid, command in rows]
+
+
+def cli_processes(rows: list[tuple[int, str]], app: Path | None = None) -> list[int]:
+    return [
+        pid for pid, command in rows
+        if Path(command).name in ("codex", "codex-cli")
+        and (app is None or not command.startswith(str(app) + "/"))
+    ]
+
+
+def require_cli_closed(app: Path | None = None) -> None:
+    pids = cli_processes(processes(), app)
+    if pids:
+        raise SwitchError(
+            "Close Codex CLI sessions and app servers before switching "
+            f"(PIDs: {', '.join(map(str, pids))}). Run this command in a normal terminal."
+        )
+
+
+def desktop_app() -> Path | None:
+    for root in (Path("/Applications"), Path.home() / "Applications"):
+        for name in ("ChatGPT.app", "Codex.app"):
+            path = root / name
+            info = path / "Contents/Info.plist"
+            if info.exists():
+                with info.open("rb") as stream:
+                    if plistlib.load(stream).get("CFBundleIdentifier") == "com.openai.codex":
+                        return path
+    return None
+
+
+def desktop_running(app: Path | None) -> bool:
+    return app is not None and any(
+        command.startswith(str(app) + "/Contents/MacOS/") for _, command in processes()
+    )
+
+
+def quit_desktop(app: Path) -> None:
+    print("Closing the desktop app. Complete any quit dialog.", flush=True)
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", 'tell application id "com.openai.codex" to quit'],
+            capture_output=True, text=True, timeout=35,
+        )
+    except subprocess.TimeoutExpired:
+        raise SwitchError("Desktop did not quit. Credentials were not changed.") from None
+    if result.returncode:
+        raise SwitchError("Desktop rejected the quit request. Credentials were not changed.")
+    deadline = time.monotonic() + 30
+    while desktop_running(app):
+        if time.monotonic() >= deadline:
+            raise SwitchError("Desktop is still running. Credentials were not changed.")
+        time.sleep(0.2)
+
+
+class Profiles:
+    def __init__(self, home: Path):
+        self.home = home.expanduser().resolve()
+        self.auth = self.home / "auth.json"
+        self.directory = self.home / "account-switch"
+        if self.directory.is_symlink():
+            raise SwitchError(f"Refusing profile directory symlink: {self.directory}")
+        config = self.home / "config.toml"
+        settings = tomllib.loads(config.read_text()) if config.exists() else {}
+        mode = settings.get("cli_auth_credentials_store", "file")
+        if mode != "file":
+            raise SwitchError(
+                f"Credential storage is {mode!r}. This tool requires "
+                '`cli_auth_credentials_store = "file"` in config.toml.'
+            )
+
+    def path(self, name: str) -> Path:
+        return self.directory / f"{name}.json"
+
+    def saved(self) -> dict[str, bytes]:
+        return {p.stem: read_auth(p) for p in sorted(self.directory.glob("*.json"))}
+
+    def current(self) -> bytes | None:
+        return read_auth(self.auth) if self.auth.exists() or self.auth.is_symlink() else None
+
+    def match(self, data: bytes | None) -> str | None:
+        if data is None:
+            return None
+        account = identity(data)
+        return next(
+            (name for name, saved in self.saved().items() if identity(saved) == account),
+            None,
+        )
+
+    @contextmanager
+    def lock(self) -> Iterator[None]:
+        if not self.home.is_dir():
+            raise SwitchError(f"Codex home does not exist: {self.home}. Run `codex login` first.")
+        self.directory.mkdir(mode=0o700, exist_ok=True)
+        self.directory.chmod(0o700)
+        fd = os.open(self.directory / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SwitchError("Another account-switch command is running.") from None
+            yield
+
+    def save(self, name: str, data: bytes) -> None:
+        existing = self.match(data)
+        if existing is not None and existing != name:
+            raise SwitchError(f"This account is already saved as {existing!r}. Use `rename`.")
+        destination = self.path(name)
+        if destination.exists() and identity(read_auth(destination)) != identity(data):
+            raise SwitchError(f"Profile {name!r} belongs to a different account.")
+        write_auth(destination, data)
+
+    def use(self, name: str) -> None:
+        target = read_auth(self.path(name))
+        current = self.current()
+        if current is not None and identity(current) == identity(target):
+            self.save(name, current)
+            print(f"{name} is already active. Saved its latest credentials.")
+            return
+        if current is not None and self.match(current) is None:
+            raise SwitchError("Save the current login first: account-switch save NAME")
+        app = desktop_app()
+        require_cli_closed(app)
+        restart = desktop_running(app)
+        if restart:
+            if self.home != (Path.home() / ".codex").resolve():
+                raise SwitchError("Close the desktop app before switching a custom CODEX_HOME.")
+            quit_desktop(app)
+        try:
+            require_cli_closed()
+            # read again after all credential writers have stopped
+            current = self.current()
+            if current is not None:
+                previous = self.match(current)
+                if previous is None:
+                    raise SwitchError("The active login changed. Save it with `save NAME` first.")
+                self.save(previous, current)
+            target = read_auth(self.path(name))
+            write_auth(self.auth, target)
+        except BaseException:
+            if restart:
+                print("Switch failed. Reopen the desktop app manually.", file=sys.stderr)
+            raise
+        print(f"Active profile: {name}. New Codex CLI sessions will use it.")
+        if restart:
+            result = subprocess.run(["/usr/bin/open", "-a", str(app)], check=False)
+            if result.returncode:
+                raise SwitchError(f"Profile {name!r} is active, but the desktop app could not reopen.")
+            print("Reopened the desktop app with the selected login.")
+
+    def login(self, name: str, device_auth: bool) -> None:
+        current = self.current()
+        if self.match(current) == name:
+            raise SwitchError("Switch to another profile before renewing the active profile's login.")
+        executable = shutil.which("codex")
+        if executable is None:
+            raise SwitchError("Cannot find `codex` on PATH.")
+        with tempfile.TemporaryDirectory(prefix=".login-", dir=self.directory) as temporary:
+            command = [executable, "-c", 'cli_auth_credentials_store="file"', "login"]
+            if device_auth:
+                command.append("--device-auth")
+            result = subprocess.run(command, env={**os.environ, "CODEX_HOME": temporary}, cwd=temporary)
+            if result.returncode:
+                raise SwitchError("Login failed. The active profile was not changed.")
+            self.save(name, read_auth(Path(temporary) / "auth.json"))
+        print(f"Saved {name}. Activate it with: account-switch use {name}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, default=Path(os.environ.get("CODEX_HOME", "~/.codex")),
+                        help="Codex home (default: CODEX_HOME or ~/.codex)")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("list", help="list profiles and the active login")
+    for verb, help_text in (
+        ("save", "save the current login under a name"),
+        ("login", "add or renew a profile through browser sign-in"),
+        ("use", "switch the shared login and restart desktop if open"),
+        ("remove", "delete an inactive saved profile"),
+        ("rename", "rename a saved profile"),
+    ):
+        command = commands.add_parser(verb, help=help_text)
+        command.add_argument("name", type=profile_name)
+        if verb == "login":
+            command.add_argument("--device-auth", action="store_true")
+        if verb == "rename":
+            command.add_argument("new_name", type=profile_name)
+    args = parser.parse_args()
+    if sys.platform != "darwin":
+        raise SwitchError("This version supports macOS only.")
+    profiles = Profiles(args.home)
+    if args.command == "list":
+        current = profiles.match(profiles.current())
+        saved = profiles.saved()
+        for name in saved:
+            print(f"{'*' if name == current else ' '} {name}")
+        if not saved:
+            print("No saved profiles. Start with: account-switch save NAME")
+        if current is None:
+            print("Active login: not saved or not signed in.")
+        return
+    with profiles.lock():
+        if args.command == "save":
+            data = profiles.current()
+            if data is None:
+                raise SwitchError("No active login. Run `codex login` first.")
+            profiles.save(args.name, data)
+            print(f"Saved current login as {args.name}.")
+        elif args.command == "login":
+            profiles.login(args.name, args.device_auth)
+        elif args.command == "use":
+            profiles.use(args.name)
+        elif args.command == "remove":
+            if profiles.match(profiles.current()) == args.name:
+                raise SwitchError("Cannot remove the active profile. Switch to another one first.")
+            profiles.path(args.name).unlink()
+            print(f"Removed {args.name}.")
+        elif args.command == "rename":
+            if profiles.path(args.new_name).exists():
+                raise SwitchError(f"Profile {args.new_name!r} already exists.")
+            profiles.path(args.name).rename(profiles.path(args.new_name))
+            print(f"Renamed {args.name} to {args.new_name}.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (SwitchError, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"account-switch: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nCanceled.", file=sys.stderr)
+        sys.exit(130)
