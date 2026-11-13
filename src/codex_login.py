@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Manage ChatGPT logins in one shared Codex home."""
+"""Switch shared Codex logins or launch the CLI in a separate home."""
 
 import argparse
 import base64
@@ -177,7 +176,7 @@ class Profiles:
             try:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise SwitchError("Another account-switch command is running.") from None
+                raise SwitchError("Another codex-login command is running.") from None
             yield
 
     def save(self, name: str, data: bytes) -> None:
@@ -197,7 +196,7 @@ class Profiles:
             print(f"{name} is already active. Saved its latest credentials.")
             return
         if current is not None and self.match(current) is None:
-            raise SwitchError("Save the current login first: account-switch save NAME")
+            raise SwitchError("Save the current login first: codex-login account save NAME")
         app = desktop_app()
         require_cli_closed(app)
         restart = desktop_running(app)
@@ -242,41 +241,119 @@ class Profiles:
             if result.returncode:
                 raise SwitchError("Login failed. The active profile was not changed.")
             self.save(name, read_auth(Path(temporary) / "auth.json"))
-        print(f"Saved {name}. Activate it with: account-switch use {name}")
+        print(f"Saved {name}. Activate it with: codex-login account switch {name}")
+
+
+def cli_homes(root: Path) -> list[str]:
+    return sorted(
+        path.name for path in root.iterdir()
+        if path.is_dir() and not path.is_symlink() and (path / "AGENTS.md").is_symlink()
+    ) if root.is_dir() else []
+
+
+def launch_cli(shared: Path, root: Path, name: str, arguments: list[str]) -> int:
+    executable = shutil.which("codex")
+    if executable is None:
+        raise SwitchError("Cannot find `codex` on PATH.")
+    home = root / name
+    login = arguments in (["login"], ["login", "--device-auth"])
+    if root.is_symlink() or home.is_symlink():
+        raise SwitchError(f"Refusing symlink in CLI home path: {home}")
+    bootstrap = shared / "AGENTS.md"
+    if not bootstrap.is_file():
+        raise SwitchError(f"Restore the wiki bootstrap at {bootstrap}.")
+    if name not in cli_homes(root):
+        if not login:
+            available = ", ".join(cli_homes(root)) or "none"
+            raise SwitchError(
+                f"Unknown CLI home {name!r}. Available: {available}. "
+                f"Set up with: codex-login cli {name} login"
+            )
+        root.mkdir(mode=0o700, exist_ok=True)
+        home.mkdir(mode=0o700)
+        (home / "AGENTS.md").symlink_to(bootstrap)
+    if (home / "AGENTS.md").resolve() != bootstrap.resolve():
+        raise SwitchError(f"Unexpected wiki bootstrap link in {home}.")
+    profiles = Profiles(home)
+    command = [executable, "-c", 'cli_auth_credentials_store="file"']
+    with profiles.lock():
+        current = profiles.current()
+        if login:
+            with tempfile.TemporaryDirectory(prefix=".login-", dir=home) as temporary:
+                result = subprocess.call(
+                    [*command, *arguments], env={**os.environ, "CODEX_HOME": temporary},
+                )
+                if result:
+                    return result
+                credentials = read_auth(Path(temporary) / "auth.json")
+                if current is not None and identity(current) != identity(credentials):
+                    raise SwitchError(f"CLI home {name!r} belongs to a different account.")
+                write_auth(profiles.auth, credentials)
+                return 0
+        if current is None:
+            raise SwitchError(f"Sign in first: codex-login cli {name} login")
+        if arguments and arguments[0] in ("login", "logout"):
+            raise SwitchError(f"Renew this login with: codex-login cli {name} login")
+        return subprocess.call(
+            [*command, *arguments], env={**os.environ, "CODEX_HOME": str(home)},
+        )
+
+
+def show_accounts(profiles: Profiles) -> list[str]:
+    current = profiles.match(profiles.current())
+    names = list(profiles.saved())
+    for name in names:
+        print(f"  {name}" + (" (active)" if name == current else ""))
+    if current is None:
+        print("  No saved account is active.")
+    return names
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--home", type=Path, default=Path(os.environ.get("CODEX_HOME", "~/.codex")),
-                        help="Codex home (default: CODEX_HOME or ~/.codex)")
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("list", help="list profiles and the active login")
+    commands = parser.add_subparsers(dest="group")
+    commands.add_parser("list", help="show shared accounts and dedicated CLI homes")
+    account = commands.add_parser("account", help="manage logins for the shared Codex home")
+    accounts = account.add_subparsers(dest="command", required=True)
+    accounts.add_parser("list", help="list saved shared accounts")
     for verb, help_text in (
         ("save", "save the current login under a name"),
-        ("login", "add or renew a profile through browser sign-in"),
-        ("use", "switch the shared login and restart desktop if open"),
-        ("remove", "delete an inactive saved profile"),
-        ("rename", "rename a saved profile"),
+        ("login", "add or renew a saved login"),
+        ("switch", "switch the shared login and restart desktop if open"),
+        ("remove", "delete an inactive saved login"),
+        ("rename", "rename a saved login"),
     ):
-        command = commands.add_parser(verb, help=help_text)
+        command = accounts.add_parser(verb, help=help_text)
         command.add_argument("name", type=profile_name)
         if verb == "login":
             command.add_argument("--device-auth", action="store_true")
         if verb == "rename":
             command.add_argument("new_name", type=profile_name)
+    cli = commands.add_parser("cli", help="run Codex in a dedicated home")
+    cli.add_argument("name", type=profile_name)
+    cli.add_argument("codex_args", nargs=argparse.REMAINDER, help="arguments for Codex CLI")
     args = parser.parse_args()
     if sys.platform != "darwin":
         raise SwitchError("This version supports macOS only.")
-    profiles = Profiles(args.home)
+    shared = Path.home() / ".codex"
+    root = Path.home() / ".codex-cli"
+    if args.group == "cli":
+        sys.exit(launch_cli(shared, root, args.name, args.codex_args))
+    profiles = Profiles(shared)
+    if args.group in (None, "list"):
+        print("Shared accounts")
+        names = show_accounts(profiles)
+        print("\nDedicated CLI homes")
+        homes = cli_homes(root)
+        for name in homes:
+            print(f"  {name}")
+        if not homes:
+            print("  Set one up with: codex-login cli NAME login")
+        print(f"\nSwitch: codex-login account switch {names[0] if names else 'NAME'}")
+        print(f"Launch: codex-login cli {homes[0] if homes else 'NAME'}")
+        return
     if args.command == "list":
-        current = profiles.match(profiles.current())
-        saved = profiles.saved()
-        for name in saved:
-            print(f"{'*' if name == current else ' '} {name}")
-        if not saved:
-            print("No saved profiles. Start with: account-switch save NAME")
-        if current is None:
-            print("Active login: not saved or not signed in.")
+        show_accounts(profiles)
         return
     with profiles.lock():
         if args.command == "save":
@@ -287,7 +364,7 @@ def main() -> None:
             print(f"Saved current login as {args.name}.")
         elif args.command == "login":
             profiles.login(args.name, args.device_auth)
-        elif args.command == "use":
+        elif args.command == "switch":
             profiles.use(args.name)
         elif args.command == "remove":
             if profiles.match(profiles.current()) == args.name:
@@ -301,11 +378,11 @@ def main() -> None:
             print(f"Renamed {args.name} to {args.new_name}.")
 
 
-if __name__ == "__main__":
+def cli() -> None:
     try:
         main()
     except (SwitchError, OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"account-switch: {error}", file=sys.stderr)
+        print(f"codex-login: {error}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nCanceled.", file=sys.stderr)
